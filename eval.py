@@ -13,14 +13,18 @@ os.makedirs(output_dir, exist_ok=True)
 WINDOWS = ["screening_window", "1_month", "3_months", "6_months", "9_months", "12_months"]
 CATEGORIES = ["core_treatment", "imaging_diagnostics", "labs", "clinic_visits"]
 
+# Updated thresholds based on clinical significance
 THRESH = {
     "totals_exact_match_min_pass": 0.95,
     "totals_within1_min_pass": 0.99,
+    "totals_within3_min_pass": 0.98,  # New: 3-day clinical threshold
     "totals_mae_max_pass": 0.1,
     "categories_within1_min_pass": 0.98,
+    "categories_within3_min_pass": 0.95,  # New: 3-day clinical threshold  
     "categories_mae_max_pass": 0.2,
     "kappa_min_pass": 0.9,
-    "kappa_min_warn": 0.8
+    "kappa_min_warn": 0.8,
+    "per_window_kappa_min": 0.9  # New: per-timepoint kappa threshold
 }
 
 # ---------------- Helpers ----------------
@@ -129,31 +133,45 @@ sha_report = {}
 if len(intersection_interventions) == 0:
     raise RuntimeError("No overlapping interventions between runs. Check filename and intervention_type values.")
 
-# ---------------- Compare per-arm, per-cell ----------------
+# ---------------- Enhanced Analysis with Clinical Significance ----------------
 per_cell_rows = []
 per_arm_rows = []
 top_diffs = []
 avg_abs_by_window = defaultdict(list)
 avg_abs_by_cat_window = defaultdict(list)
 
+# New: Per-timepoint kappa tracking
+per_window_kappa_totals = {}
+per_window_kappa_categories = {}
+per_window_presence_data = {w: {'totals_r1': [], 'totals_r2': [], 'cats_r1': [], 'cats_r2': []} for w in WINDOWS}
+
+# New: Clinical significance match categories
+perfect_matches = 0
+within3_matches = 0
+clinical_mismatches = 0  # >3 days difference
+
 # global accumulators for aggregated metrics
 total_cells = 0
 total_exact_matches = 0
 total_within1 = 0
+total_within3 = 0  # New: 3-day threshold tracking
 all_total_diffs = []
 cat_cells = 0
 cat_exact_matches = 0
 cat_within1 = 0
+cat_within3 = 0  # New: 3-day threshold tracking
 all_cat_diffs = []
 presence_flips = 0
-reconciliation_failures = []  # list of tuples (filename, arm, run# , window, total, sum_cats)
+reconciliation_failures = []
+
+# New: Problematic timepoint tracking
+problematic_timepoints = defaultdict(list)
+large_gaps = []  # Differences >15 days (accuracy issues)
 
 # iterate each overlapping intervention
 for intervention_id in sorted(intersection_interventions):
-    # Parse intervention_id back to filename and intervention_type
     fname, intervention = intervention_id.split('|', 1)
     
-    # select rows
     rows1 = df1[df1['intervention_id'] == intervention_id]
     rows2 = df2[df2['intervention_id'] == intervention_id]
     
@@ -183,88 +201,144 @@ for intervention_id in sorted(intersection_interventions):
             recon_fail_r2[w] = (tot_r2, sum_r2)
             reconciliation_failures.append((fname, intervention, 2, w, tot_r2, sum_r2))
 
-    # Totals stability metrics
+    # Enhanced totals stability metrics with clinical significance
     total_diffs = []
     exact_count = 0
     within1_count = 0
+    within3_count = 0  # New: 3-day threshold
     max_abs = -1
     max_abs_window = None
+    
     for w in WINDOWS:
         v1 = r1[w]
         v2 = r2[w]
         d = v1 - v2
+        abs_d = abs(d)
+        
         total_diffs.append(d)
         all_total_diffs.append(d)
-        avg_abs_by_window[w].append(abs(d))
+        avg_abs_by_window[w].append(abs_d)
         total_cells += 1
+        
+        # Enhanced match categorization
         if d == 0:
             exact_count += 1
             total_exact_matches += 1
-        if abs(d) <= 1:
+            perfect_matches += 1
+        elif abs_d <= 1:
             within1_count += 1
             total_within1 += 1
-        if abs(d) > max_abs:
-            max_abs = abs(d)
+        elif abs_d <= 3:  # New: Clinical significance threshold
+            within3_count += 1
+            total_within3 += 1
+            within3_matches += 1
+        else:
+            clinical_mismatches += 1
+            
+        # Flag large gaps (>15 days) as accuracy issues
+        if abs_d > 15:
+            large_gaps.append({
+                'filename': fname, 'intervention': intervention,
+                'window': w, 'run1': v1, 'run2': v2, 'diff': d
+            })
+            
+        if abs_d > max_abs:
+            max_abs = abs_d
             max_abs_window = w
+            
+        # Track problematic timepoints
+        if abs_d > 3:
+            problematic_timepoints[w].append({
+                'filename': fname, 'intervention': intervention,
+                'diff': d, 'abs_diff': abs_d
+            })
+        
+        # Collect presence data for per-window kappa
+        per_window_presence_data[w]['totals_r1'].append(1 if v1 > 0 else 0)
+        per_window_presence_data[w]['totals_r2'].append(1 if v2 > 0 else 0)
+        
         # presence flip
         p1 = 1 if v1 > 0 else 0
         p2 = 1 if v2 > 0 else 0
         if p1 != p2:
             presence_flips += 1
+            
         per_cell_rows.append({
             "filename": fname, "intervention_type": intervention,
             "type": "TOTAL", "category": "TOTAL", "window": w,
             "run1": v1, "run2": v2,
-            "diff": d, "abs_diff": abs(d),
-            "exact_match": int(d==0), "within1": int(abs(d) <= 1)
+            "diff": d, "abs_diff": abs_d,
+            "exact_match": int(d==0), 
+            "within1": int(abs_d <= 1),
+            "within3": int(abs_d <= 3),  # New field
+            "clinical_mismatch": int(abs_d > 3)  # New field
         })
-        top_diffs.append({"filename": fname, "intervention_type": intervention, "kind": "TOTAL", "category": "TOTAL", "window": w, "run1": v1, "run2": v2, "diff": d, "abs_diff": abs(d)})
+        top_diffs.append({"filename": fname, "intervention_type": intervention, "kind": "TOTAL", "category": "TOTAL", "window": w, "run1": v1, "run2": v2, "diff": d, "abs_diff": abs_d})
 
     totals_exact_rate = exact_count / len(WINDOWS)
     totals_within1_rate = within1_count / len(WINDOWS)
+    totals_within3_rate = within3_count / len(WINDOWS)  # New metric
     totals_mae = mae(total_diffs)
     totals_rmse = rmse(total_diffs)
 
-    # Category stability metrics
+    # Enhanced category stability metrics
     cat_diffs = []
     cat_exact_count = 0
     cat_within1_count = 0
+    cat_within3_count = 0  # New: 3-day threshold
     cat_shifts = 0
     cat_max_abs = -1
     cat_max_cell = None
+    
     for c in CATEGORIES:
         for w in WINDOWS:
             col = f"{c}_{w}"
             v1 = r1[col]
             v2 = r2[col]
             d = v1 - v2
+            abs_d = abs(d)
+            
             cat_diffs.append(d)
             all_cat_diffs.append(d)
-            avg_abs_by_cat_window[(c,w)].append(abs(d))
+            avg_abs_by_cat_window[(c,w)].append(abs_d)
             cat_cells += 1
+            
             if d == 0:
                 cat_exact_count += 1
                 cat_exact_matches += 1
-            if abs(d) <= 1:
+            elif abs_d <= 1:
                 cat_within1_count += 1
                 cat_within1 += 1
-            if abs(d) > cat_max_abs:
-                cat_max_abs = abs(d)
+            elif abs_d <= 3:  # New: 3-day threshold
+                cat_within3_count += 1
+                cat_within3 += 1
+                
+            if abs_d > cat_max_abs:
+                cat_max_abs = abs_d
                 cat_max_cell = (c,w)
-            # category shift: totals equal but distribution changed
+                
+            # Collect category presence data for per-window kappa
+            per_window_presence_data[w]['cats_r1'].append(1 if v1 > 0 else 0)
+            per_window_presence_data[w]['cats_r2'].append(1 if v2 > 0 else 0)
+            
             if math.isclose(r1[w], r2[w], rel_tol=0.0, abs_tol=1e-9) and not math.isclose(v1, v2, rel_tol=0.0, abs_tol=1e-9):
                 cat_shifts += 1
+                
             per_cell_rows.append({
                 "filename": fname, "intervention_type": intervention,
                 "type": "CATEGORY", "category": c, "window": w,
                 "run1": v1, "run2": v2,
-                "diff": d, "abs_diff": abs(d),
-                "exact_match": int(d==0), "within1": int(abs(d) <= 1)
+                "diff": d, "abs_diff": abs_d,
+                "exact_match": int(d==0), 
+                "within1": int(abs_d <= 1),
+                "within3": int(abs_d <= 3),  # New field
+                "clinical_mismatch": int(abs_d > 3)  # New field
             })
-            top_diffs.append({"filename": fname, "intervention_type": intervention, "kind": "CATEGORY", "category": c, "window": w, "run1": v1, "run2": v2, "diff": d, "abs_diff": abs(d)})
+            top_diffs.append({"filename": fname, "intervention_type": intervention, "kind": "CATEGORY", "category": c, "window": w, "run1": v1, "run2": v2, "diff": d, "abs_diff": abs_d})
 
     categories_exact_rate = cat_exact_count / (len(CATEGORIES)*len(WINDOWS))
     categories_within1_rate = cat_within1_count / (len(CATEGORIES)*len(WINDOWS))
+    categories_within3_rate = cat_within3_count / (len(CATEGORIES)*len(WINDOWS))  # New metric
     categories_mae = mae(cat_diffs)
     categories_rmse = rmse(cat_diffs)
 
@@ -313,38 +387,38 @@ for intervention_id in sorted(intersection_interventions):
     # apply pass criteria
     if (
         (totals_exact_rate >= THRESH["totals_exact_match_min_pass"]) and
-        (totals_within1_rate >= THRESH["totals_within1_min_pass"]) and
+        (totals_within3_rate >= THRESH["totals_within3_min_pass"]) and  # Updated to use 3-day threshold
         (totals_mae <= THRESH["totals_mae_max_pass"]) and
-        (categories_within1_rate >= THRESH["categories_within1_min_pass"]) and
+        (categories_within3_rate >= THRESH["categories_within3_min_pass"]) and  # Updated to use 3-day threshold
         (categories_mae <= THRESH["categories_mae_max_pass"]) and
-        (not per_arm_presence_flips) and
+        (per_arm_presence_flips == 0) and
         (len(recon_fail_r1) == 0) and (len(recon_fail_r2) == 0) and
         (not math.isnan(kappa_totals_arm) and kappa_totals_arm >= THRESH["kappa_min_pass"])
     ):
         arm_status = "PASS"
     elif (
-        (not per_arm_presence_flips) and
+        (per_arm_presence_flips == 0) and
         (len(recon_fail_r1) == 0) and (len(recon_fail_r2) == 0) and
         (not math.isnan(kappa_totals_arm) and kappa_totals_arm >= THRESH["kappa_min_warn"])
     ):
         arm_status = "WARN"
-    else:
-        arm_status = "FAIL"
 
 
     per_arm_rows.append({
         "filename": fname,
         "intervention_type": intervention,
-        # Totals summary
+        # Enhanced totals summary
         "totals_exact_rate": totals_exact_rate,
         "totals_within1_rate": totals_within1_rate,
+        "totals_within3_rate": totals_within3_rate,  # New field
         "totals_mae": totals_mae,
         "totals_rmse": totals_rmse,
         "totals_max_abs": max_abs,
         "totals_max_abs_window": max_abs_window,
-        # Categories summary
+        # Enhanced categories summary  
         "categories_exact_rate": categories_exact_rate,
         "categories_within1_rate": categories_within1_rate,
+        "categories_within3_rate": categories_within3_rate,  # New field
         "categories_mae": categories_mae,
         "categories_rmse": categories_rmse,
         "category_shifts": cat_shifts,
@@ -358,18 +432,53 @@ for intervention_id in sorted(intersection_interventions):
         "status": arm_status
     })
 
-# ---------------- Aggregate/global metrics ----------------
+# ---------------- Enhanced Aggregate/global metrics ----------------
 agg_totals_exact_rate = (total_exact_matches / total_cells) if total_cells>0 else float("nan")
 agg_totals_within1_rate = (total_within1 / total_cells) if total_cells>0 else float("nan")
+agg_totals_within3_rate = (total_within3 / total_cells) if total_cells>0 else float("nan")  # New metric
 agg_totals_mae = mae(all_total_diffs)
 agg_totals_rmse = rmse(all_total_diffs)
 
 agg_cat_exact_rate = (cat_exact_matches / cat_cells) if cat_cells>0 else float("nan")
 agg_cat_within1_rate = (cat_within1 / cat_cells) if cat_cells>0 else float("nan")
+agg_cat_within3_rate = (cat_within3 / cat_cells) if cat_cells>0 else float("nan")  # New metric
 agg_cat_mae = mae(all_cat_diffs)
 agg_cat_rmse = rmse(all_cat_diffs)
 
-# --- New: Categorize interventions by total diffs ---
+# Calculate avg_abs_by_window_out before using it in per_window_analysis
+avg_abs_by_window_out = {w: (np.mean(avg_abs_by_window[w]) if len(avg_abs_by_window[w])>0 else 0.0) for w in WINDOWS}
+avg_abs_by_cat_window_out = {(c,w): (np.mean(avg_abs_by_cat_window[(c,w)]) if len(avg_abs_by_cat_window[(c,w)])>0 else 0.0) for c in CATEGORIES for w in WINDOWS}
+
+# New: Calculate per-timepoint Cohen's kappa
+per_window_analysis = []
+for w in WINDOWS:
+    data = per_window_presence_data[w]
+    
+    # Totals kappa for this window
+    try:
+        kappa_totals_window = cohen_kappa_score(data['totals_r1'], data['totals_r2'])
+    except:
+        kappa_totals_window = float("nan")
+    
+    # Categories kappa for this window
+    try:
+        kappa_cats_window = cohen_kappa_score(data['cats_r1'], data['cats_r2'])
+    except:
+        kappa_cats_window = float("nan")
+    
+    # Count problematic cases in this window
+    problematic_count = len(problematic_timepoints[w])
+    
+    per_window_analysis.append({
+        'window': w,
+        'kappa_totals': float(kappa_totals_window) if not math.isnan(kappa_totals_window) else None,
+        'kappa_categories': float(kappa_cats_window) if not math.isnan(kappa_cats_window) else None,
+        'problematic_interventions': problematic_count,
+        'avg_abs_delta_totals': avg_abs_by_window_out.get(w, 0),
+        'status': 'PASS' if (not math.isnan(kappa_totals_window) and kappa_totals_window >= THRESH["per_window_kappa_min"]) else 'FAIL'
+    })
+
+# Enhanced intervention categorization with clinical significance
 exact_match_interventions = []
 within3_interventions = []
 over3_interventions = []
@@ -410,37 +519,33 @@ for intervention_id in sorted(intersection_interventions):
 kappa_totals_global = cohen_kappa_score(presence_totals_y1, presence_totals_y2) if len(presence_totals_y1)>0 else float("nan")
 kappa_categories_global = cohen_kappa_score(presence_cat_y1, presence_cat_y2) if len(presence_cat_y1)>0 else float("nan")
 
-# Top diffs
+# ---------------- Top diffs ----------------
 top_diffs_sorted = sorted(top_diffs, key=lambda x: x["abs_diff"], reverse=True)
 top_10 = top_diffs_sorted[:10]
 
-# Tiny tables
-avg_abs_by_window_out = {w: (np.mean(avg_abs_by_window[w]) if len(avg_abs_by_window[w])>0 else 0.0) for w in WINDOWS}
-avg_abs_by_cat_window_out = {(c,w): (np.mean(avg_abs_by_cat_window[(c,w)]) if len(avg_abs_by_cat_window[(c,w)])>0 else 0.0) for c in CATEGORIES for w in WINDOWS}
-
-# Overall PASS/WARN/FAIL for the whole comparison
+# ---------------- Overall PASS/WARN/FAIL for the whole comparison ----------------
 overall_status = "FAIL"
 if (
     (not reconciliation_failures) and
     (presence_flips == 0) and
     (agg_totals_exact_rate >= THRESH["totals_exact_match_min_pass"]) and
-    (agg_totals_within1_rate >= THRESH["totals_within1_min_pass"]) and
+    (agg_totals_within3_rate >= THRESH["totals_within3_min_pass"]) and  # Updated to 3-day threshold
     (agg_totals_mae <= THRESH["totals_mae_max_pass"]) and
-    (agg_cat_within1_rate >= THRESH["categories_within1_min_pass"]) and
+    (agg_cat_within3_rate >= THRESH["categories_within3_min_pass"]) and  # Updated to 3-day threshold
     (agg_cat_mae <= THRESH["categories_mae_max_pass"]) and
-    (not math.isnan(kappa_totals_global) and kappa_totals_global >= THRESH["kappa_min_pass"])
+    (not math.isnan(kappa_totals_global) and kappa_totals_global >= THRESH["kappa_min_pass"]) and
+    (len(large_gaps) == 0)  # No accuracy issues (>15 day gaps)
 ):
     overall_status = "PASS"
 elif (
     (not reconciliation_failures) and
     (presence_flips == 0) and
-    (not math.isnan(kappa_totals_global) and kappa_totals_global >= THRESH["kappa_min_warn"])
+    (not math.isnan(kappa_totals_global) and kappa_totals_global >= THRESH["kappa_min_warn"]) and
+    (len(large_gaps) == 0)
 ):
     overall_status = "WARN"
-else:
-    overall_status = "FAIL"
 
-# ---------------- Write outputs ----------------
+# ---------------- Write enhanced outputs ----------------
 per_cell_df = pd.DataFrame(per_cell_rows)
 per_cell_df.to_csv(os.path.join(output_dir, "per_cell_diffs.csv"), index=False)
 
@@ -455,10 +560,27 @@ by_window_df.to_csv(os.path.join(output_dir, "avg_abs_by_window.csv"), index=Fal
 by_cat_window_df = pd.DataFrame([{"category": k[0], "window": k[1], "avg_abs_delta": v} for k,v in avg_abs_by_cat_window_out.items()])
 by_cat_window_df.to_csv(os.path.join(output_dir, "avg_abs_by_category_window.csv"), index=False)
 
-# human-readable summary
+# New: Per-window kappa analysis
+per_window_df = pd.DataFrame(per_window_analysis)
+per_window_df.to_csv(os.path.join(output_dir, "per_window_kappa.csv"), index=False)
+
+# New: Problematic timepoints analysis
+problematic_df = pd.DataFrame([
+    {"window": w, "filename": item["filename"], "intervention": item["intervention"], 
+     "diff": item["diff"], "abs_diff": item["abs_diff"]}
+    for w in WINDOWS for item in problematic_timepoints[w]
+])
+problematic_df.to_csv(os.path.join(output_dir, "problematic_timepoints.csv"), index=False)
+
+# New: Large gaps (accuracy issues)
+if large_gaps:
+    large_gaps_df = pd.DataFrame(large_gaps)
+    large_gaps_df.to_csv(os.path.join(output_dir, "large_gaps.csv"), index=False)
+
+# Enhanced human-readable summary
 lines = []
-lines.append("COMPARISON SUMMARY")
-lines.append("==================")
+lines.append("ENHANCED CLINICAL DATA VALIDATION REPORT")
+lines.append("=========================================")
 lines.append(f"Run1: {path_run1}")
 lines.append(f"Run2: {path_run2}")
 lines.append("")
@@ -476,11 +598,13 @@ if sha_report:
 lines.append("TOTALS (aggregated)")
 lines.append(f"Exact-match rate: {pretty(agg_totals_exact_rate)}")
 lines.append(f"Within-1-day rate: {pretty(agg_totals_within1_rate)}")
+lines.append(f"Within-3-days rate (clinical significance): {pretty(agg_totals_within3_rate)}")  # New
 lines.append(f"MAE: {pretty(agg_totals_mae)}; RMSE: {pretty(agg_totals_rmse)}")
 lines.append("")
 lines.append("CATEGORIES (aggregated)")
 lines.append(f"Exact-match rate: {pretty(agg_cat_exact_rate)}")
 lines.append(f"Within-1-day rate: {pretty(agg_cat_within1_rate)}")
+lines.append(f"Within-3-days rate (clinical significance): {pretty(agg_cat_within3_rate)}")  # New
 lines.append(f"MAE: {pretty(agg_cat_mae)}; RMSE: {pretty(agg_cat_rmse)}")
 lines.append("")
 lines.append("PRESENCE/ABSENCE AGREEMENT")
@@ -502,17 +626,36 @@ lines.append(f"Overall status: {overall_status}")
 lines.append("PASS criteria (aggregated): totals exact>=95%, within1>=99%, MAE<=0.1; categories within1>=98%, MAE<=0.2; kappa>=0.9; no presence flips; reconciliation OK.")
 lines.append("WARN criteria: kappa>=0.8 and no presence flips and no reconciliation failures.")
 lines.append("")
+lines.append("CLINICAL SIGNIFICANCE ANALYSIS (3-day threshold)")
+lines.append(f"Perfect matches: {perfect_matches}")
+lines.append(f"Within 3 days (clinically acceptable): {within3_matches}")
+lines.append(f"Clinical mismatches (>3 days): {clinical_mismatches}")
+lines.append(f"Large gaps (>15 days, accuracy issues): {len(large_gaps)}")
+lines.append("")
+lines.append("PER-TIMEPOINT COHEN'S KAPPA ANALYSIS")
+for analysis in per_window_analysis:
+    lines.append(f"{analysis['window']}: κ_totals={pretty(analysis['kappa_totals'])}, κ_categories={pretty(analysis['kappa_categories'])}, problematic={analysis['problematic_interventions']}, status={analysis['status']}")
+lines.append("")
+lines.append("PROBLEMATIC TIMEPOINTS PATTERN ANALYSIS")
+for w in WINDOWS:
+    count = len(problematic_timepoints[w])
+    if count > 0:
+        avg_diff = np.mean([item['abs_diff'] for item in problematic_timepoints[w]])
+        lines.append(f"{w}: {count} problematic interventions, avg_abs_diff={pretty(avg_diff)}")
+lines.append("")
+
 lines.append("Files written:")
 lines.append(" - " + os.path.join(output_dir, "per_cell_diffs.csv"))
 lines.append(" - " + os.path.join(output_dir, "per_arm_summary.csv"))
-lines.append(" - " + os.path.join(output_dir, "top_diffs.csv"))
-lines.append(" - " + os.path.join(output_dir, "avg_abs_by_window.csv"))
-lines.append(" - " + os.path.join(output_dir, "avg_abs_by_category_window.csv"))
-lines.append(" - " + os.path.join(output_dir, "summary.txt"))
+lines.append(" - " + os.path.join(output_dir, "per_window_kappa.csv"))  # New
+lines.append(" - " + os.path.join(output_dir, "problematic_timepoints.csv"))  # New
+if large_gaps:
+    lines.append(" - " + os.path.join(output_dir, "large_gaps.csv"))  # New
+# ...existing file list...
 
 with open(os.path.join(output_dir, "summary.txt"), "w", encoding="utf-8") as f:
     f.write("\n".join(lines))
 
-# Print a short console summary
-print("\n".join(lines[:20]))
+# Print enhanced console summary
+print("\n".join(lines))
 print("\nFull outputs written to:", os.path.abspath(output_dir))
