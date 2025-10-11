@@ -1,0 +1,53 @@
+COMPARISON SUMMARY
+==================
+Run1: runs\batch1.csv
+Run2: runs\batch2.csv
+
+INPUT & COVERAGE
+Unique files Run1: 81; Run2: 81
+Unique interventions Run1: 141; Run2: 144
+Intervention coverage (intersection/union): 134/151 = 0.8874
+Only in Run1: 7; Only in Run2: 10
+
+TOTALS (aggregated)
+Exact-match rate: 0.5249
+Within-1-day rate: 0.7338
+MAE: 2.7711; RMSE: 7.7156
+
+CATEGORIES (aggregated)
+Exact-match rate: 0.6947
+Within-1-day rate: 0.8293
+MAE: 1.3296; RMSE: 4.5913
+
+PRESENCE/ABSENCE AGREEMENT
+Cohen's kappa (totals): 0.8883
+Cohen's kappa (categories): 0.6591
+Presence flips (0<->>0 across all cells): 1
+
+RECONCILIATION
+Reconciliation failures (sum(categories) != total): 0
+
+TOP 10 ABSOLUTE DIFFS
+35922251 | control | CATEGORY | core_treatment | 12_months: 90.0 -> 18.0 | Δ=72.0
+37875143 | control | TOTAL | TOTAL | 12_months: 90.0 -> 18.0 | Δ=72.0
+37875143 | control | CATEGORY | core_treatment | 12_months: 90.0 -> 18.0 | Δ=72.0
+37875143 | intervention | TOTAL | TOTAL | 12_months: 90.0 -> 18.0 | Δ=72.0
+37875143 | intervention | CATEGORY | core_treatment | 12_months: 90.0 -> 18.0 | Δ=72.0
+35922251 | control | CATEGORY | core_treatment | 9_months: 70.0 -> 13.0 | Δ=57.0
+35922251 | control | TOTAL | TOTAL | 12_months: 98.0 -> 44.0 | Δ=54.0
+37875143 | control | TOTAL | TOTAL | 9_months: 65.0 -> 13.0 | Δ=52.0
+37875143 | control | CATEGORY | core_treatment | 9_months: 65.0 -> 13.0 | Δ=52.0
+37875143 | intervention | TOTAL | TOTAL | 9_months: 65.0 -> 13.0 | Δ=52.0
+
+OVERALL PASS/WARN/FAIL
+Overall status: FAIL
+PASS criteria (aggregated): totals exact>=95%, within1>=99%, MAE<=0.1; categories within1>=98%, MAE<=0.2; kappa>=0.9; no presence flips; reconciliation OK.
+WARN criteria: kappa>=0.8 and no presence flips and no reconciliation failures.
+
+Files written:
+ - results\per_cell_diffs.csv
+ - results\per_arm_summary.csv
+ - results\top_diffs.csv
+ - results\avg_abs_by_window.csv
+ - results\avg_abs_by_category_window.csv
+ - results\summary.txt
