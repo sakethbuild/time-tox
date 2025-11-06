@@ -4,7 +4,7 @@ import json
 import csv
 import re
 import time
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Set
 
 from google import genai
 from google.genai import types
@@ -12,7 +12,7 @@ from google.genai import types
 def setup_gemini_api_v2():
     """Setup Gemini API authentication for second section"""
     # Hardcoded API key - replace with your actual API key
-    api_key = "YOUR_GEMINI_API_KEY_HERE"
+    api_key = "AIzaSyCP75KKzQ7Cqy5ENazfwZMARWzT0mHeUD0"
     os.environ["GEMINI_API_KEY"] = api_key
     print("Gemini API key configured successfully.")
 
@@ -72,7 +72,105 @@ def get_user_processing_parameters():
         'csv_filename': csv_filename
     }
 
-def get_multiple_pdfs_from_summaries(start_index=0, num_pdfs=None):
+def get_processed_filenames(csv_filename: str) -> Set[str]:
+    """Read existing CSV and return set of already-processed filenames."""
+    processed = set()
+    if os.path.exists(csv_filename):
+        try:
+            with open(csv_filename, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if 'filename' in row and row['filename']:
+                        processed.add(row['filename'])
+            print(f"Found {len(processed)} already-processed files in {csv_filename}")
+        except Exception as e:
+            print(f"Warning: Could not read existing CSV: {e}")
+    return processed
+
+
+def initialize_csv_if_needed(output_csv_name: str) -> None:
+    """Create CSV with headers if it doesn't exist."""
+    if os.path.exists(output_csv_name):
+        return
+    
+    windows = ['screening_window', '1_month', '3_months', '6_months', '9_months', '12_months']
+    categories = ['core_treatment', 'imaging_diagnostics', 'labs', 'clinic_visits']
+
+    headers = [
+        'filename',
+        'arm_name',
+        'intervention_type',
+    ]
+
+    # total counts per window
+    headers += [w for w in windows]
+
+    # category breakdown columns
+    for cat in categories:
+        for w in windows:
+            headers.append(f"{cat}_{w}")
+
+    headers += [
+        'cycle_length_days',
+        'treatment_duration_rule',
+        'visit_pattern',
+        'assumptions'
+    ]
+
+    with open(output_csv_name, 'w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(headers)
+    print(f"Created new CSV file: {output_csv_name}")
+
+
+def append_result_to_csv(result: Dict[str, Any], output_csv_name: str) -> None:
+    """Append a single result (all arms) to CSV immediately after processing."""
+    windows = ['screening_window', '1_month', '3_months', '6_months', '9_months', '12_months']
+    categories = ['core_treatment', 'imaging_diagnostics', 'labs', 'clinic_visits']
+
+    def get(d, *path, default=''):
+        cur = d
+        for k in path:
+            if isinstance(cur, dict) and k in cur:
+                cur = cur[k]
+            else:
+                return default
+        return cur
+
+    with open(output_csv_name, 'a', newline='', encoding='utf-8') as csvfile:
+        writer = csv.writer(csvfile)
+        
+        filename = result.get('filename', '')
+        for arm_data in result.get('arms', []):
+            row = [
+                filename,
+                arm_data.get('arm_name', ''),
+                arm_data.get('intervention_type', ''),
+            ]
+
+            # totals per window
+            for w in windows:
+                row.append(get(arm_data, 'healthcare_contact_days', w, default=''))
+
+            # per-category per window
+            for cat in categories:
+                for w in windows:
+                    row.append(get(arm_data, 'category_breakdown', cat, w, default=''))
+
+            # notes
+            row.extend([
+                get(arm_data, 'extraction_notes', 'cycle_length_days', default=''),
+                get(arm_data, 'extraction_notes', 'treatment_duration_rule', default=''),
+                get(arm_data, 'extraction_notes', 'visit_pattern', default=''),
+                '; '.join(get(arm_data, 'extraction_notes', 'assumptions', default=[])) if isinstance(get(arm_data, 'extraction_notes', 'assumptions', default=[]), list) else get(arm_data, 'extraction_notes', 'assumptions', default='')
+            ])
+
+            writer.writerow(row)
+    
+    print(f"✓ Saved {len(result.get('arms', []))} arm(s) from {filename} to CSV")
+
+
+def get_multiple_pdfs_from_summaries(start_index=0, num_pdfs=None, processed_filenames: Set[str] = None):
     """Get multiple PDFs from summaries folder for batch processing with custom parameters."""
     summaries_folder = os.path.join(os.getcwd(), "summaries")
     pdf_files = []
@@ -80,6 +178,9 @@ def get_multiple_pdfs_from_summaries(start_index=0, num_pdfs=None):
     if not os.path.exists(summaries_folder):
         print(f"Summaries folder not found: {summaries_folder}")
         return pdf_files
+
+    if processed_filenames is None:
+        processed_filenames = set()
 
     # Get all PDF files first
     all_files = []
@@ -99,12 +200,21 @@ def get_multiple_pdfs_from_summaries(start_index=0, num_pdfs=None):
     
     selected_files = all_files[start_index:]
     
+    # Filter out already-processed files
+    unprocessed_files = []
+    for filename in selected_files:
+        pmid = extract_pmid_from_filename(filename)
+        if pmid not in processed_filenames:
+            unprocessed_files.append(filename)
+        else:
+            print(f"Skipping already-processed: {filename}")
+    
     # Apply number limit
     if num_pdfs is not None:
-        selected_files = selected_files[:num_pdfs]
+        unprocessed_files = unprocessed_files[:num_pdfs]
     
     # Load the selected files
-    for filename in selected_files:
+    for filename in unprocessed_files:
         file_path = os.path.join(summaries_folder, filename)
         with open(file_path, 'rb') as f:
             content = f.read()
@@ -112,6 +222,8 @@ def get_multiple_pdfs_from_summaries(start_index=0, num_pdfs=None):
         print(f"Selected PDF: {filename}")
 
     print(f"\nTotal PDFs to process: {len(pdf_files)} (from index {start_index})")
+    if processed_filenames:
+        print(f"Skipped {len(selected_files) - len(unprocessed_files)} already-processed PDFs")
     return pdf_files
 
 
@@ -219,106 +331,258 @@ def process_single_pdf(client: genai.Client, filename: str, pdf_content: bytes, 
             temperature=0.3,
             response_mime_type="text/plain",
             system_instruction=[
-                types.Part.from_text(text="""SYSTEM PROMPT
-You are an expert clinical‑trial protocol analyst.
-Your task is to read a cancer‑trial Schedule of Events (SoE) or equivalent from the text and output the exact number of in‑person healthcare‑contact days per treatment arm at six fixed intervals. You will be provided clinical trial protocols with content deemed relevant to be able to extract healthcare contact days.
-If there is nothing in the PDF that allows you to extract events or assessment schedules, please PRINT: NO DATA FOUND.
+                types.Part.from_text(text="""role: "Expert Clinical Trial Protocol Analyst"
 
-1  Key definitions
-Healthcare‑contact day – Any calendar date on which the participant must physically attend a healthcare facility or meet face‑to‑face with study staff for trial‑mandated procedures. Count 1 per date, no matter how many procedures occur that day.
+no_data_sentinel: "NO DATA FOUND"  # Print exactly this (unquoted) if schedule data cannot be extracted
 
-NOT a contact day – Tele‑visits, phone calls, home diaries, couriered drug, or truly optional ("as needed") visits.
+primary_objective: |
+  Extract the exact number of in-person healthcare contact days per treatment arm
+  across six fixed time intervals from clinical trial protocols.
 
-Anchor (Day 0) – Cycle 1 Day 1 (C1D1): the first on‑treatment visit or first dose, whichever is earlier.
+core_definitions:
+  healthcare_contact_day:
+    definition: |
+      Any calendar date requiring the participant to physically attend a healthcare
+      facility or meet face-to-face with study staff for trial-mandated procedures.
+    counting_rule: "Count 1 per unique date, regardless of how many procedures occur that day."
+  not_contact_days:
+    description: "The following do NOT count as contact days:"
+    exclusions:
+      - "Tele-visits or phone calls"
+      - "Home diaries or self-administered assessments"
+      - "Couriered drug deliveries"
+      - "Truly optional ('as needed') visits"
+  anchor_point:
+    day_zero: "Cycle 1 Day 1 (C1D1)"
+    definition: "The first on-treatment visit OR first dose administration, whichever occurs earlier."
+  time_windows:  # All bounds are inclusive
+    screening_window:
+      range: "Day -28 to Day -1 (inclusive)"
+      start: -28
+      end: -1
+    "1_month":
+      range: "Day 0 to Day +30 (inclusive)"
+      start: 0
+      end: 30
+    "3_months":
+      range: "Day 0 to Day +90 (inclusive)"
+      start: 0
+      end: 90
+    "6_months":
+      range: "Day 0 to Day +180 (inclusive)"
+      start: 0
+      end: 180
+    "9_months":
+      range: "Day 0 to Day +270 (inclusive)"
+      start: 0
+      end: 270
+    "12_months":
+      range: "Day 0 to Day +365 (inclusive)"
+      start: 0
+      end: 365
 
-Time windows (inclusive):
-  • Screening window  = Day ‑28 → Day ‑1
-  • 1 month   = Day 0 → Day +30
-  • 3 months  = Day 0 → Day +90
-  • 6 months  = Day 0 → Day +180
-  • 9 months  = Day 0 → Day +270
-  • 12 months = Day 0 → Day +365
+extraction_algorithm:
+  note: "Think through this process silently. Do NOT output your chain of thought."
+  defaults:
+    cycle_length_days: 28
+    treatment_duration_rule: "until progression"
+    horizon_day: 365
+    cycle_length_overrides:
+      - pattern: "presence of a recurring mid-cycle 'Day 14–21' column or equivalent across cycles"
+        set_cycle_length_days: 21
+  steps:
+    - name: "Isolate Treatment Arms"
+      action: "Identify each treatment arm's Schedule of Events (SoE) or equivalent table."
+    - name: "Build Visit Pattern"
+      actions:
+        - "List every column that represents an in-person visit (e.g., 'Screening', 'Randomisation', 'Day 1', 'Day 14–21')."
+        - "For rows labelled 'SUBSEQUENT CYCLES' (or similar), record which visit columns persist; if a column is absent, assume that visit does NOT occur for cycles ≥ 2."
+    - name: "Identify In-Person Visit Columns"
+      actions:
+        - "Mark ANY column as an in-person visit if required in-person assessments appear in its rows (e.g., vitals, physical exam, hematology/biochemistry, ECG/ECHO, imaging), even if no drug administration occurs in that column."
+        - "Columns labeled with ranges (e.g., 'Day 14–21') represent ONE in-person visit scheduled within that window unless the row text explicitly indicates multi-day treatment (e.g., 'Days 1–5 radiation')."
+    - name: "Infer Cycle Length"
+      actions:
+        - "If mid-cycle columns are labeled 'Day 14–21' (or equivalent) consistently, set cycle_length_days=21 unless the protocol states otherwise."
+    - name: "Create Canonical Schedule"
+      components:
+        baseline_visits: "Fixed dates between Day -28 and Day -1."
+        cycle_1_visits: "Exact offsets from Day 0 (e.g., Day 0, +7, +14)."
+        repeating_cycles: "Apply offsets every cycle_length_days (default 28; use inferred override if present)."
+    - name: "Enumerate Calendar Dates"
+      actions:
+        - "Enumerate all nominal visit dates through Day +365."
+        - "Assume regimen continues 'until progression' unless the protocol states otherwise."
+    - name: "Count Unique Dates"
+      actions:
+        - "Count unique calendar dates falling within each time window."
+        - "Include partial cycles: if a visit's nominal date falls inside a window, count it."
+    - name: "Quality Check"
+      actions:
+        - "Independently recompute counts via a second method; if disagreement, reconcile before answering."
 
-2  Extraction algorithm (think silently—do not output your chain of thought)
-Isolate each arm's SoE table.
+special_rules:
+  baseline_split:
+    condition: "If 'Screening' and 'Randomisation' appear as separate columns"
+    action: "Treat them as two distinct days"
+    exception: "Only consolidate if an SoE footnote explicitly allows same-day completion."
+  conditional_optional_visits:
+    exclude_if_labeled:
+      - "Optional"
+      - "If clinically indicated"
+      - "As needed"
+    include_if_drug_continues: "If conditional on continuing a drug, assume the drug continues unless stated otherwise."
+  multi_day_blocks:
+    example: "'Days 1–5' radiotherapy = 5 separate contact days"
+    rule: "Count only those days that fall inside the target time window."
+  range_as_single_visit:
+    rule: "A column labeled as a day-range (e.g., 'Day 14–21') is a single mandatory in-person visit scheduled within that window, unless the text states multi-day administration (then apply multi-day rules)."
+    nominal_day_choice: "Use the earliest day in the range for calendarization (e.g., Day 14) unless a footnote specifies a different nominal day."
+  mandatory_mid_cycle_visits:
+    critical: true
+    description: |
+      For any cycle where a non-drug column (e.g., 'Day 14–21') includes required in-person assessments
+      (vitals, labs, physical exam, AE checks, ECG/ECHO, imaging), COUNT it as a separate healthcare-contact day.
+      This applies even when active treatment is given only on Day 1.
+    validation: "If an SoE shows both Day 1 and mid-cycle in-person assessments, per-cycle contact days MUST be ≥ 2 unless mid-cycle is explicitly optional."
+  ambiguity_handling:
+    approach: "Use the most conservative lower estimate."
+    requirement: "Document every assumption in extraction_notes."
+  tie_breaker_precedence:
+    rule: "Assign each in-person calendar day to EXACTLY ONE primary category; if multiple activities occur, use precedence:"
+    hierarchy:
+      - "core_treatment"
+      - "imaging_diagnostics"
+      - "labs"
+      - "clinic_visits"
 
-Create a visit pattern:
-   • List every column that represents an in‑person visit (e.g., "Screening", "Randomisation", "Day 1", "Day 15").
-   • For rows labelled "SUBSEQUENT CYCLES" or similar, record which visit columns are present; if a column is absent, assume that visit does not occur for cycles ≥ 2.
+category_classification:
+  categories:
+    core_treatment:
+      description: "Active treatment delivery (chemo, immunotherapy, targeted therapy, infusions, radiation fractions, interventional procedures as part of treatment, port care related to treatment, surgery)."
+    imaging_diagnostics:
+      description: "Imaging (CT/MRI/PET/US/X-ray), ECG/EKG, echocardiogram, diagnostic biopsies for assessment, pulmonary function tests, stress tests, other diagnostics."
+    labs:
+      description: "Phlebotomy visits and urine collections requiring in-person attendance."
+    clinic_visits:
+      description: "H&P, AE checks, vitals, weight, questionnaires/ePRO in clinic, nurse/physician visits, consent updates, counseling, education sessions."
 
-Build a canonical schedule:
-   • Baseline visits → fixed dates: Day ‑28 ≤ date ≤ ‑1.
-   • Cycle 1 visits → exact offsets (Day 0, Day +14, Day +7 etc.).
-   • Repeating cycles → apply offsets every cycle_length days (default 28 unless otherwise stated).
+output_format:
+  requirements:
+    - "Return a single JSON array."
+    - "One object per treatment arm."
+    - "OUTPUT ONLY THE JSON (no additional text)."
+    - "Within each window, category subtotals must equal total healthcare_contact_days."
+  json_structure:
+    type: "array"
+    items:
+      - arm_name:
+          type: "string"
+          description: "Exact arm name from the protocol."
+        intervention_type:
+          type: "string"
+          enum: ["intervention", "control"]
+        healthcare_contact_days:
+          screening_window: { type: "integer" }
+          "1_month": { type: "integer" }
+          "3_months": { type: "integer" }
+          "6_months": { type: "integer" }
+          "9_months": { type: "integer" }
+          "12_months": { type: "integer" }
+        category_breakdown:
+          core_treatment:
+            screening_window: { type: "integer" }
+            "1_month": { type: "integer" }
+            "3_months": { type: "integer" }
+            "6_months": { type: "integer" }
+            "9_months": { type: "integer" }
+            "12_months": { type: "integer" }
+          imaging_diagnostics:
+            screening_window: { type: "integer" }
+            "1_month": { type: "integer" }
+            "3_months": { type: "integer" }
+            "6_months": { type: "integer" }
+            "9_months": { type: "integer" }
+            "12_months": { type: "integer" }
+          labs:
+            screening_window: { type: "integer" }
+            "1_month": { type: "integer" }
+            "3_months": { type: "integer" }
+            "6_months": { type: "integer" }
+            "9_months": { type: "integer" }
+            "12_months": { type: "integer" }
+          clinic_visits:
+            screening_window: { type: "integer" }
+            "1_month": { type: "integer" }
+            "3_months": { type: "integer" }
+            "6_months": { type: "integer" }
+            "9_months": { type: "integer" }
+            "12_months": { type: "integer" }
+        extraction_notes:
+          assumptions:
+            type: "array"
+            items: { type: "string" }
+            description: "Bullet list of assumptions or judgments made."
+          visit_pattern:
+            type: "string"
+            description: "Enumerate the visit columns counted as in-person (e.g., 'Screening', 'C1D1', 'C1D14–21', ... 'CkD1', 'CkD14–21') and state that range-columns were mapped to one nominal date."
+          cycle_length_days:
+            type: "integer"
+          treatment_duration_rule:
+            type: "string"
+            example: "until progression"
 
-Enumerate calendar dates for each visit through Day +365, assuming the regimen continues "until progression."
-
-Count unique dates that fall inside each window.
-   Do not require the entire cycle to fit—include any visit whose nominal date is inside the window.
-
-Quality check: independently recompute the counts; if the two methods disagree, reconcile before answering.
-
-3  Special rules & assumptions
-Baseline split – If "Screening" and "Randomisation" appear as separate columns, treat them as two distinct days unless an SoE footnote explicitly allows same‑day consolidation.
-
-Footnotes that make visits conditional – If a visit is labelled "optional" or "if clinically indicated," exclude it; if it is conditional on continuing a drug (e.g., bevacizumab), assume the drug continues.
-
-Multi‑day blocks – "Days 1‑5" radiotherapy = 5 contact days; count only those days inside the window.
-
-When data are ambiguous – Use the most conservative lower estimate and list the assumption.
-
-4  Category classification (assign each in‑person calendar day to exactly ONE primary category)
-Categories:
-  a) core_treatment – active treatment delivery (chemotherapy, immunotherapy, targeted therapy, infusion, radiation fractions, interventional procedures including biopsies strictly as part of treatment delivery, port care related to treatment, surgery days).
-  b) imaging_diagnostics – imaging (CT/MRI/PET/US/X‑ray), ECG/EKG, echocardiogram, diagnostic biopsies performed for assessment (not as part of treatment delivery), pulmonary function tests, stress tests, other diagnostic procedures.
-  c) labs – phlebotomy visits, urine collections that require in‑person attendance.
-  d) clinic_visits – H&P, AE checks, vitals, weight, questionnaires/ePRO done in clinic, nurse/physician visits, consent updates, counseling, education sessions.
-
-Tie‑breaker precedence if multiple activities occur on the same calendar day:
-  core_treatment > imaging_diagnostics > labs > clinic_visits.
-That is, assign the day to the highest‑priority category present.
-
-5  Output format (return a single JSON array; one object per arm) — output only JSON
-[
-  {
-    "arm_name": "<exact arm name from the protocol>",
-    "intervention_type": "<intervention or control>",
-    "healthcare_contact_days": {
-      "screening_window": <integer>,
-      "1_month": <integer>,
-      "3_months": <integer>,
-      "6_months": <integer>,
-      "9_months": <integer>,
-      "12_months": <integer>
-    },
-    "category_breakdown": {
-      "core_treatment": {
-        "screening_window": <integer>, "1_month": <integer>, "3_months": <integer>, "6_months": <integer>, "9_months": <integer>, "12_months": <integer>
+example_json: |
+  [
+    {
+      "arm_name": "<exact arm name from the protocol>",
+      "intervention_type": "<intervention or control>",
+      "healthcare_contact_days": {
+        "screening_window": 0,
+        "1_month": 0,
+        "3_months": 0,
+        "6_months": 0,
+        "9_months": 0,
+        "12_months": 0
       },
-      "imaging_diagnostics": {
-        "screening_window": <integer>, "1_month": <integer>, "3_months": <integer>, "6_months": <integer>, "9_months": <integer>, "12_months": <integer>
+      "category_breakdown": {
+        "core_treatment": {
+          "screening_window": 0, "1_month": 0, "3_months": 0, "6_months": 0, "9_months": 0, "12_months": 0
+        },
+        "imaging_diagnostics": {
+          "screening_window": 0, "1_month": 0, "3_months": 0, "6_months": 0, "9_months": 0, "12_months": 0
+        },
+        "labs": {
+          "screening_window": 0, "1_month": 0, "3_months": 0, "6_months": 0, "9_months": 0, "12_months": 0
+        },
+        "clinic_visits": {
+          "screening_window": 0, "1_month": 0, "3_months": 0, "6_months": 0, "9_months": 0, "12_months": 0
+        }
       },
-      "labs": {
-        "screening_window": <integer>, "1_month": <integer>, "3_months": <integer>, "6_months": <integer>, "9_months": <integer>, "12_months": <integer>
-      },
-      "clinic_visits": {
-        "screening_window": <integer>, "1_month": <integer>, "3_months": <integer>, "6_months": <integer>, "9_months": <integer>, "12_months": <integer>
+      "extraction_notes": {
+        "assumptions": ["<assumption 1>", "<assumption 2>"],
+        "visit_pattern": "<concise description>",
+        "cycle_length_days": 21,
+        "treatment_duration_rule": "until progression"
       }
-    },
-    "extraction_notes": {
-      "assumptions": ["<bullet point list of any assumptions or judgments made>"],
-      "visit_pattern": "<concise description>",
-      "cycle_length_days": <integer>,
-      "treatment_duration_rule": "<e.g. 'until progression'>"
     }
-  }
-]
+  ]
 
-6  Final checklist (silent)
-Each calendar date counted once?
-Category precedence applied?
-Category sums within a window must equal total healthcare‑contact days for that window?
-Assumptions listed?"""),
+final_validation_checklist:
+  note: "Verify silently before submitting."
+  checks:
+    - "Each calendar date counted exactly once (no duplicates)."
+    - "Category precedence applied correctly (core_treatment > imaging_diagnostics > labs > clinic_visits)."
+    - "Within each window, category sums equal total healthcare_contact_days."
+    - "Per-cycle sanity check: If cycle_length_days=21 and mid-cycle in-person assessments are present, verify ≥2 contact days per cycle through Day +365; if not, recompute and record an assumption explaining why."
+    - "Category distribution check: If totals are dominated by 'core_treatment' when mid-cycle assessments exist, recompute to ensure mid-cycle contacts are counted."
+    - "All assumptions documented in extraction_notes."
+    - "JSON is valid and properly formatted."
+  failure_action: |
+    If the SoE or equivalent schedule cannot be extracted, output ONLY:
+    NO DATA FOUND
+
+instruction: "NOW PROCEED WITH THE ANALYSIS OF THE PROVIDED CLINICAL TRIAL PROTOCOL"""),
             ],
         )
 
@@ -379,82 +643,16 @@ Assumptions listed?"""),
 
 
 def save_aggregate_results(all_results: List[Dict[str, Any]], path: str = 'aggregate_results.json') -> None:
+    """Save aggregate JSON results (optional backup)."""
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(all_results, f, indent=2, ensure_ascii=False)
     print(f"Aggregate results saved to {path}")
 
 
 def save_csv_results(all_results: List[Dict[str, Any]], output_csv_name: str = 'clinical_trial_results.csv'):
-    """Save CSV file with flattened results, including category breakdowns per window."""
-    if not all_results:
-        return
-
-    windows = ['screening_window', '1_month', '3_months', '6_months', '9_months', '12_months']
-    categories = ['core_treatment', 'imaging_diagnostics', 'labs', 'clinic_visits']
-
-    headers = [
-        'filename',
-        'arm_name',
-        'intervention_type',
-    ]
-
-    # total counts per window
-    headers += [w for w in windows]
-
-    # category breakdown columns
-    for cat in categories:
-        for w in windows:
-            headers.append(f"{cat}_{w}")
-
-    headers += [
-        'cycle_length_days',
-        'treatment_duration_rule',
-        'visit_pattern',
-        'assumptions'
-    ]
-
-    with open(output_csv_name, 'w', newline='', encoding='utf-8') as csvfile:
-        writer = csv.writer(csvfile)
-        writer.writerow(headers)
-
-        def get(d, *path, default=''):
-            cur = d
-            for k in path:
-                if isinstance(cur, dict) and k in cur:
-                    cur = cur[k]
-                else:
-                    return default
-            return cur
-
-        for result in all_results:
-            filename = result.get('filename', '')
-            for arm_data in result.get('arms', []):
-                row = [
-                    filename,
-                    arm_data.get('arm_name', ''),
-                    arm_data.get('intervention_type', ''),
-                ]
-
-                # totals per window
-                for w in windows:
-                    row.append(get(arm_data, 'healthcare_contact_days', w, default=''))
-
-                # per-category per window
-                for cat in categories:
-                    for w in windows:
-                        row.append(get(arm_data, 'category_breakdown', cat, w, default=''))
-
-                # notes
-                row.extend([
-                    get(arm_data, 'extraction_notes', 'cycle_length_days', default=''),
-                    get(arm_data, 'extraction_notes', 'treatment_duration_rule', default=''),
-                    get(arm_data, 'extraction_notes', 'visit_pattern', default=''),
-                    '; '.join(get(arm_data, 'extraction_notes', 'assumptions', default=[])) if isinstance(get(arm_data, 'extraction_notes', 'assumptions', default=[]), list) else get(arm_data, 'extraction_notes', 'assumptions', default='')
-                ])
-
-                writer.writerow(row)
-
-    print(f"CSV results saved to {output_csv_name}")
+    """Deprecated - now using append_result_to_csv for immediate saves."""
+    # This function is no longer needed as we save incrementally
+    pass
 
 
 def generate():
@@ -465,35 +663,51 @@ def generate():
     if params is None:
         return
     
+    csv_filename = params['csv_filename']
+    
+    # Initialize CSV if needed
+    initialize_csv_if_needed(csv_filename)
+    
+    # Get already-processed filenames
+    processed_filenames = get_processed_filenames(csv_filename)
+    
+    # Get PDFs to process (excluding already-processed ones)
     pdf_files = get_multiple_pdfs_from_summaries(
         start_index=params['start_index'],
-        num_pdfs=params['num_pdfs']
+        num_pdfs=params['num_pdfs'],
+        processed_filenames=processed_filenames
     )
     if not pdf_files:
+        print("No new PDFs to process.")
         return
 
     client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
     model = "gemini-2.5-flash"
 
     all_results: List[Dict[str, Any]] = []
+    successful_count = 0
+    
     for i, (filename, pdf_content) in enumerate(pdf_files, 1):
         print(f"\n\nProcessing file {i} of {len(pdf_files)}")
         result = process_single_pdf(client, filename, pdf_content, model)
         if result:
             all_results.append(result)
+            # Save to CSV immediately after processing
+            append_result_to_csv(result, csv_filename)
+            successful_count += 1
 
     print(f"\n\n{'='*60}")
     print("BATCH PROCESSING COMPLETE")
     print(f"{'='*60}")
-    print(f"Successfully processed: {len(all_results)} out of {len(pdf_files)} PDFs")
+    print(f"Successfully processed: {successful_count} out of {len(pdf_files)} PDFs")
 
     if all_results:
         save_aggregate_results(all_results)
-        save_csv_results(all_results, params['csv_filename'])
         total_arms = sum(len(result['arms']) for result in all_results)
         print(f"Total treatment arms extracted: {total_arms}")
+        print(f"All results saved to: {csv_filename}")
     else:
-        print("No results to save.")
+        print("No new results to save.")
 
 
 if __name__ == "__main__":
