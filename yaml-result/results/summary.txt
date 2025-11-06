@@ -1,0 +1,79 @@
+ENHANCED CLINICAL DATA VALIDATION REPORT
+=========================================
+Run1: runs/batch1.csv
+Run2: runs/batch2.csv
+
+INPUT & COVERAGE
+Unique files Run1: 97; Run2: 97
+Unique interventions Run1: 183; Run2: 182
+Intervention coverage (intersection/union): 178/187 = 0.9519
+Only in Run1: 5; Only in Run2: 4
+
+TOTALS (aggregated)
+Exact-match rate: 0.4934
+Within-1-day rate: 0.6564
+Within-3-days rate (clinical significance): 0.7687
+MAE: 3.2444; RMSE: 7.7396
+
+CATEGORIES (aggregated)
+Exact-match rate: 0.6894
+Within-1-day rate: 0.8076
+Within-3-days rate (clinical significance): 0.8848
+MAE: 1.5246; RMSE: 4.8295
+
+PRESENCE/ABSENCE AGREEMENT
+Cohen's kappa (totals): 0.0000
+Cohen's kappa (categories): 0.6493
+Cohen's kappa (totals — by numeric values): 0.4706
+Cohen's kappa (categories — by numeric values): 0.5401
+Presence flips (0<->>0 across all cells): 4
+
+RECONCILIATION
+Reconciliation failures (sum(categories) != total): 0
+
+TOP 10 ABSOLUTE DIFFS
+37875143 | control | TOTAL | TOTAL | 12_months: 18.0 -> 94.0 | Δ=-76.0
+37875143 | intervention | TOTAL | TOTAL | 12_months: 18.0 -> 94.0 | Δ=-76.0
+37875143 | control | CATEGORY | core_treatment | 12_months: 18.0 -> 90.0 | Δ=-72.0
+37875143 | intervention | CATEGORY | core_treatment | 12_months: 18.0 -> 90.0 | Δ=-72.0
+37875143 | control | TOTAL | TOTAL | 9_months: 13.0 -> 68.0 | Δ=-55.0
+37875143 | intervention | TOTAL | TOTAL | 9_months: 13.0 -> 68.0 | Δ=-55.0
+35665782 | control | CATEGORY | core_treatment | 12_months: 0.0 -> 52.0 | Δ=-52.0
+35665782 | control | CATEGORY | imaging_diagnostics | 12_months: 53.0 -> 1.0 | Δ=52.0
+37875143 | control | CATEGORY | core_treatment | 9_months: 13.0 -> 65.0 | Δ=-52.0
+37875143 | intervention | CATEGORY | core_treatment | 9_months: 13.0 -> 65.0 | Δ=-52.0
+
+OVERALL PASS/WARN/FAIL
+Overall status: FAIL
+PASS criteria (aggregated): totals exact>=95%, within1>=99%, MAE<=0.1; categories within1>=98%, MAE<=0.2; kappa>=0.9; no presence flips; reconciliation OK.
+WARN criteria: kappa>=0.8 and no presence flips and no reconciliation failures.
+
+CLINICAL SIGNIFICANCE ANALYSIS (3-day threshold)
+Perfect matches: 527
+Within 3 days (clinically acceptable): 821
+Clinical mismatches (>3 days): 247
+Large gaps (>15 days, accuracy issues): 50
+
+PER-TIMEPOINT COHEN'S KAPPA ANALYSIS
+screening_window: κ_totals=None, κ_categories=0.6872, problematic=2, status=FAIL
+1_month: κ_totals=0.0000, κ_categories=0.7255, problematic=11, status=FAIL
+3_months: κ_totals=0.0000, κ_categories=0.6600, problematic=43, status=FAIL
+6_months: κ_totals=None, κ_categories=0.6014, problematic=60, status=FAIL
+9_months: κ_totals=None, κ_categories=0.6015, problematic=64, status=FAIL
+12_months: κ_totals=None, κ_categories=0.5952, problematic=67, status=FAIL
+
+PROBLEMATIC TIMEPOINTS PATTERN ANALYSIS
+screening_window: 2 problematic interventions, avg_abs_diff=4.0000
+1_month: 11 problematic interventions, avg_abs_diff=7.3636
+3_months: 43 problematic interventions, avg_abs_diff=8.0000
+6_months: 60 problematic interventions, avg_abs_diff=10.6167
+9_months: 64 problematic interventions, avg_abs_diff=13.3750
+12_months: 67 problematic interventions, avg_abs_diff=16.0448
+
+Files written:
+ - results/per_cell_diffs.csv
+ - results/per_arm_summary.csv
+ - results/per_window_kappa.csv
+ - results/problematic_timepoints.csv
+ - results/large_gaps.csv
+ - results/run_summary_days.csv
