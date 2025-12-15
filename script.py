@@ -12,7 +12,7 @@ from google.genai import types
 def setup_gemini_api_v2():
     """Setup Gemini API authentication for second section"""
     # Hardcoded API key - replace with your actual API key
-    api_key = "AIzaSyCP75KKzQ7Cqy5ENazfwZMARWzT0mHeUD0"
+    api_key = ""
     os.environ["GEMINI_API_KEY"] = api_key
     print("Gemini API key configured successfully.")
 
@@ -712,3 +712,4 @@ def generate():
 
 if __name__ == "__main__":
     generate()
+
