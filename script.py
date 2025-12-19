@@ -1,20 +1,128 @@
 import os
-import tempfile
 import json
 import csv
 import re
 import time
+import requests
 from typing import List, Dict, Any, Set
+from datetime import datetime
 
-from google import genai
-from google.genai import types
+from pypdf import PdfReader
 
-def setup_gemini_api_v2():
-    """Setup Gemini API authentication for second section"""
-    # Hardcoded API key - replace with your actual API key
-    api_key = ""
-    os.environ["GEMINI_API_KEY"] = api_key
-    print("Gemini API key configured successfully.")
+# ---------------------------
+# Configurations
+# ---------------------------
+
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
+MODEL = "deepseek/deepseek-chat-v3.1"
+SLEEP_BETWEEN_REQUESTS = 5  # seconds
+MAX_PAGES_TO_EXTRACT = 4  # Only extract first N pages
+
+def log(message: str):
+    """Print timestamped log message"""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {message}")
+
+
+def setup_openrouter_api():
+    """Setup OpenRouter API authentication"""
+    log(f"OpenRouter API configured")
+    log(f"Model: {MODEL}")
+    log(f"Base URL: {OPENROUTER_BASE_URL}")
+    return OPENROUTER_API_KEY
+
+
+def extract_text_from_pdf(pdf_path: str, max_pages: int = MAX_PAGES_TO_EXTRACT) -> str:
+    """Extract text from first N pages of PDF using pypdf"""
+    log(f"Extracting text from first {max_pages} pages of PDF...")
+    try:
+        reader = PdfReader(pdf_path)
+        total_pages = len(reader.pages)
+        pages_to_extract = min(max_pages, total_pages)
+        
+        log(f"PDF has {total_pages} pages, extracting first {pages_to_extract}")
+        
+        all_text = []
+        for page_num in range(pages_to_extract):
+            try:
+                text = reader.pages[page_num].extract_text()
+                if text and text.strip():
+                    all_text.append(f"=== PAGE {page_num + 1} ===\n{text.strip()}\n")
+                    log(f"  Page {page_num + 1}: {len(text)} chars extracted")
+                else:
+                    log(f"  Page {page_num + 1}: No text (may be scanned/image)")
+            except Exception as e:
+                log(f"  Page {page_num + 1}: Error - {e}")
+        
+        full_text = "\n".join(all_text)
+        log(f"Total extracted: {len(full_text)} characters from {len(all_text)} pages")
+        
+        return full_text
+    except Exception as e:
+        log(f"Error reading PDF: {e}")
+        return ""
+
+
+def call_deepseek_with_text(api_key: str, text_content: str, prompt: str, system_prompt: str, temperature: float = 0.3) -> str:
+    """Call DeepSeek API via OpenRouter with text content"""
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com/clinical-trial-analyzer",
+        "X-Title": "Clinical Trial Protocol Analyzer"
+    }
+    
+    # Build message with text content
+    full_prompt = f"{prompt}\n\n--- PROTOCOL TEXT (First {MAX_PAGES_TO_EXTRACT} pages) ---\n\n{text_content}"
+    
+    messages = [
+        {
+            "role": "system",
+            "content": system_prompt
+        },
+        {
+            "role": "user",
+            "content": full_prompt
+        }
+    ]
+    
+    payload = {
+        "model": MODEL,
+        "messages": messages,
+        "temperature": temperature,
+    }
+    
+    log(f"Sending text to OpenRouter (DeepSeek v3)...")
+    log(f"Text content length: {len(text_content)} characters")
+    log(f"Request payload size: {len(json.dumps(payload)) // 1024} KB")
+    
+    start_time = time.time()
+    response = requests.post(OPENROUTER_BASE_URL, headers=headers, json=payload, timeout=600)
+    elapsed_time = time.time() - start_time
+    
+    log(f"Response received in {elapsed_time:.2f} seconds")
+    log(f"Response status: {response.status_code}")
+    
+    if response.status_code != 200:
+        log(f"ERROR - Response body: {response.text[:500]}")
+        response.raise_for_status()
+    
+    raw_response = response.json()
+    
+    # Log usage info if available
+    if "usage" in raw_response:
+        usage = raw_response["usage"]
+        log(f"Tokens used - Prompt: {usage.get('prompt_tokens', 'N/A')}, Completion: {usage.get('completion_tokens', 'N/A')}, Total: {usage.get('total_tokens', 'N/A')}")
+    
+    if "error" in raw_response:
+        log(f"API Error: {raw_response['error']}")
+        raise Exception(f"API Error: {raw_response['error']}")
+    
+    content = raw_response["choices"][0]["message"]["content"]
+    log(f"Response content length: {len(content)} characters")
+    
+    return content
 
 
 def get_user_processing_parameters():
@@ -72,6 +180,7 @@ def get_user_processing_parameters():
         'csv_filename': csv_filename
     }
 
+
 def get_processed_filenames(csv_filename: str) -> Set[str]:
     """Read existing CSV and return set of already-processed filenames."""
     processed = set()
@@ -96,26 +205,12 @@ def initialize_csv_if_needed(output_csv_name: str) -> None:
     windows = ['screening_window', '1_month', '3_months', '6_months', '9_months', '12_months']
     categories = ['core_treatment', 'imaging_diagnostics', 'labs', 'clinic_visits']
 
-    headers = [
-        'filename',
-        'arm_name',
-        'intervention_type',
-    ]
-
-    # total counts per window
+    headers = ['filename', 'arm_name', 'intervention_type']
     headers += [w for w in windows]
-
-    # category breakdown columns
     for cat in categories:
         for w in windows:
             headers.append(f"{cat}_{w}")
-
-    headers += [
-        'cycle_length_days',
-        'treatment_duration_rule',
-        'visit_pattern',
-        'assumptions'
-    ]
+    headers += ['cycle_length_days', 'treatment_duration_rule', 'visit_pattern', 'assumptions']
 
     with open(output_csv_name, 'w', newline='', encoding='utf-8') as csvfile:
         writer = csv.writer(csvfile)
@@ -142,29 +237,18 @@ def append_result_to_csv(result: Dict[str, Any], output_csv_name: str) -> None:
         
         filename = result.get('filename', '')
         for arm_data in result.get('arms', []):
-            row = [
-                filename,
-                arm_data.get('arm_name', ''),
-                arm_data.get('intervention_type', ''),
-            ]
-
-            # totals per window
+            row = [filename, arm_data.get('arm_name', ''), arm_data.get('intervention_type', '')]
             for w in windows:
                 row.append(get(arm_data, 'healthcare_contact_days', w, default=''))
-
-            # per-category per window
             for cat in categories:
                 for w in windows:
                     row.append(get(arm_data, 'category_breakdown', cat, w, default=''))
-
-            # notes
             row.extend([
                 get(arm_data, 'extraction_notes', 'cycle_length_days', default=''),
                 get(arm_data, 'extraction_notes', 'treatment_duration_rule', default=''),
                 get(arm_data, 'extraction_notes', 'visit_pattern', default=''),
                 '; '.join(get(arm_data, 'extraction_notes', 'assumptions', default=[])) if isinstance(get(arm_data, 'extraction_notes', 'assumptions', default=[]), list) else get(arm_data, 'extraction_notes', 'assumptions', default='')
             ])
-
             writer.writerow(row)
     
     print(f"✓ Saved {len(result.get('arms', []))} arm(s) from {filename} to CSV")
@@ -182,25 +266,20 @@ def get_multiple_pdfs_from_summaries(start_index=0, num_pdfs=None, processed_fil
     if processed_filenames is None:
         processed_filenames = set()
 
-    # Get all PDF files first
     all_files = []
     for filename in os.listdir(summaries_folder):
         if filename.lower().endswith('.pdf'):
             all_files.append(filename)
     
-    # Sort files for consistent ordering
     all_files.sort()
-    
     print(f"Found {len(all_files)} total PDFs in summaries folder")
     
-    # Apply start index
     if start_index >= len(all_files):
         print(f"Error: Starting index {start_index} is beyond available files (max index: {len(all_files)-1})")
         return pdf_files
     
     selected_files = all_files[start_index:]
     
-    # Filter out already-processed files
     unprocessed_files = []
     for filename in selected_files:
         pmid = extract_pmid_from_filename(filename)
@@ -209,21 +288,15 @@ def get_multiple_pdfs_from_summaries(start_index=0, num_pdfs=None, processed_fil
         else:
             print(f"Skipping already-processed: {filename}")
     
-    # Apply number limit
     if num_pdfs is not None:
         unprocessed_files = unprocessed_files[:num_pdfs]
     
-    # Load the selected files
     for filename in unprocessed_files:
         file_path = os.path.join(summaries_folder, filename)
-        with open(file_path, 'rb') as f:
-            content = f.read()
-        pdf_files.append((filename, content))
+        pdf_files.append((filename, file_path))  # Changed: store path instead of content
         print(f"Selected PDF: {filename}")
 
     print(f"\nTotal PDFs to process: {len(pdf_files)} (from index {start_index})")
-    if processed_filenames:
-        print(f"Skipped {len(selected_files) - len(unprocessed_files)} already-processed PDFs")
     return pdf_files
 
 
@@ -235,8 +308,14 @@ def extract_pmid_from_filename(filename: str) -> str:
 
 def _strip_code_fences(text: str) -> str:
     """Remove common Markdown code fences around JSON/text."""
-    text = re.sub(r"```(?:json)?\n(.*?)```", r"\1", text, flags=re.DOTALL | re.IGNORECASE)
-    text = text.replace("```", "")
+    # Handle ```json ... ``` blocks (with optional language specifier)
+    text = re.sub(r"```(?:json)?\s*\n?(.*?)```", r"\1", text, flags=re.DOTALL | re.IGNORECASE)
+    # Handle '''json ... ''' blocks (single quotes)
+    text = re.sub(r"'''(?:json)?\s*\n?(.*?)'''", r"\1", text, flags=re.DOTALL | re.IGNORECASE)
+    # Handle """json ... """ blocks (double quotes)
+    text = re.sub(r'"""(?:json)?\s*\n?(.*?)"""', r"\1", text, flags=re.DOTALL | re.IGNORECASE)
+    # Remove any remaining fence markers
+    text = text.replace("```", "").replace("'''", "").replace('"""', "")
     return text.strip()
 
 
@@ -247,6 +326,19 @@ def parse_json_response(response_text: str) -> List[Dict[str, Any]]:
     def _validate(obj: Any) -> bool:
         return isinstance(obj, dict) and 'arm_name' in obj and 'healthcare_contact_days' in obj
 
+    # First, try to find JSON array starting with [ and ending with ]
+    array_match = re.search(r'\[\s*\{.*\}\s*\]', text, flags=re.DOTALL)
+    if array_match:
+        try:
+            data = json.loads(array_match.group(0))
+            if isinstance(data, list):
+                valid_items = [d for d in data if _validate(d)]
+                if valid_items:
+                    return valid_items
+        except Exception:
+            pass
+
+    # Try parsing the whole cleaned text as JSON
     try:
         data = json.loads(text)
         if isinstance(data, list):
@@ -256,16 +348,31 @@ def parse_json_response(response_text: str) -> List[Dict[str, Any]]:
     except Exception:
         pass
 
-    brace_pattern = r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}"
+    # Try to find JSON objects individually (nested brace matching)
     objs = []
-    for m in re.finditer(brace_pattern, text, flags=re.DOTALL):
-        chunk = m.group(0)
-        try:
-            candidate = json.loads(chunk)
-            if _validate(candidate):
-                objs.append(candidate)
-        except Exception:
-            continue
+    # Find all potential JSON object starts
+    i = 0
+    while i < len(text):
+        if text[i] == '{':
+            # Try to find matching closing brace
+            brace_count = 0
+            start = i
+            for j in range(i, len(text)):
+                if text[j] == '{':
+                    brace_count += 1
+                elif text[j] == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        chunk = text[start:j+1]
+                        try:
+                            candidate = json.loads(chunk)
+                            if _validate(candidate):
+                                objs.append(candidate)
+                        except Exception:
+                            pass
+                        break
+        i += 1
+    
     return objs
 
 
@@ -296,44 +403,7 @@ def _validate_category_sums(arm: Dict[str, Any]) -> None:
             print(f"WARNING: Arm '{arm.get('arm_name','?')}', window '{w}' -> total={expected} but category sum={s}.")
 
 
-def process_single_pdf(client: genai.Client, filename: str, pdf_content: bytes, model: str):
-    """Process a single PDF file and return a result entry or None."""
-    print(f"\n{'='*60}")
-    print(f"Processing: {filename}")
-    print(f"{'='*60}")
-
-    with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp_pdf:
-        temp_pdf.write(pdf_content)
-        temp_pdf_path = temp_pdf.name
-
-    try:
-        print("Uploading PDF to Gemini for analysis...")
-        uploaded_file = client.files.upload(file=temp_pdf_path)
-        print("PDF uploaded successfully.")
-
-        contents = [
-            types.Content(
-                role="user",
-                parts=[
-                    types.Part.from_uri(
-                        file_uri=uploaded_file.uri,
-                        mime_type=uploaded_file.mime_type,
-                    ),
-                    types.Part.from_text(text=(
-                        "Please analyze this clinical trial protocol PDF and extract the "
-                        "Schedule of Events information according to the system instructions."
-                    )),
-                ],
-            ),
-        ]
-
-        generate_content_config = types.GenerateContentConfig(
-            temperature=0.3,
-            response_mime_type="text/plain",
-            system_instruction=[
-                types.Part.from_text(text="""role: "Expert Clinical Trial Protocol Analyst"
-
-no_data_sentinel: "NO DATA FOUND"  # Print exactly this (unquoted) if schedule data cannot be extracted
+SYSTEM_PROMPT = """role: "Expert Clinical Trial Protocol Analyst"
 
 primary_objective: |
   Extract the exact number of in-person healthcare contact days per treatment arm
@@ -578,68 +648,106 @@ final_validation_checklist:
     - "Category distribution check: If totals are dominated by 'core_treatment' when mid-cycle assessments exist, recompute to ensure mid-cycle contacts are counted."
     - "All assumptions documented in extraction_notes."
     - "JSON is valid and properly formatted."
-  failure_action: |
-    If the SoE or equivalent schedule cannot be extracted, output ONLY:
-    NO DATA FOUND
 
-instruction: "NOW PROCEED WITH THE ANALYSIS OF THE PROVIDED CLINICAL TRIAL PROTOCOL"""),
-            ],
-        )
+instruction: "NOW PROCEED WITH THE ANALYSIS OF THE PROVIDED CLINICAL TRIAL PROTOCOL"
+"""
 
-        print(f"Analyzing {filename}...")
 
-        response_text = ""
+def process_single_pdf(api_key: str, filename: str, pdf_path: str, file_index: int, total_files: int):
+    """Process a single PDF file and return a result entry or None."""
+    log(f"")
+    log(f"{'='*60}")
+    log(f"PROCESSING FILE {file_index}/{total_files}: {filename}")
+    log(f"{'='*60}")
+    log(f"PDF path: {pdf_path}")
+    
+    # Check file exists and get size
+    if not os.path.exists(pdf_path):
+        log(f"ERROR: File not found: {pdf_path}")
+        return None
+    
+    file_size_mb = os.path.getsize(pdf_path) / (1024 * 1024)
+    log(f"File size: {file_size_mb:.2f} MB")
+
+    try:
+        # Extract text from first N pages
+        log("")
+        log("[Step 1] Extracting text from PDF...")
+        extracted_text = extract_text_from_pdf(pdf_path, MAX_PAGES_TO_EXTRACT)
+        
+        if not extracted_text or len(extracted_text.strip()) < 100:
+            log("ERROR: Could not extract sufficient text from PDF")
+            return None
+        
+        # Show sample of extracted text
+        log("")
+        log("[Sample of extracted text - first 1000 chars]")
+        log("-" * 40)
+        print(extracted_text[:1000])
+        log("-" * 40)
+        
+        prompt = "Analyze this clinical trial protocol and extract the Schedule of Events information. Return the healthcare contact days for each treatment arm as JSON according to the system instructions."
+        
         max_retries = 3
+        response_text = ""
+        
         for attempt in range(max_retries):
             try:
-                # Attempt to generate content
-                for chunk in client.models.generate_content_stream(
-                    model=model,
-                    contents=contents,
-                    config=generate_content_config,
-                ):
-                    if chunk.text is not None:
-                        print(chunk.text, end="")
-                        response_text += chunk.text
-                break  # If successful, exit the retry loop
+                log(f"")
+                log(f"[Step 2] Sending to DeepSeek - Attempt {attempt + 1}/{max_retries}")
+                response_text = call_deepseek_with_text(api_key, extracted_text, prompt, SYSTEM_PROMPT, temperature=0.3)
+                
+                log("")
+                log("=" * 40)
+                log("DEEPSEEK RESPONSE:")
+                log("=" * 40)
+                print(response_text)
+                log("=" * 40)
+                
+                break
+                
             except Exception as e:
-                # Check if it's a service unavailable or rate limit error
                 error_msg = str(e).lower()
-                if any(keyword in error_msg for keyword in ['overloaded', 'unavailable', 'rate limit', 'quota', 'timeout']):
+                if any(keyword in error_msg for keyword in ['overloaded', 'unavailable', 'rate limit', 'quota', 'timeout', '529', '503']):
                     if attempt < max_retries - 1:
-                        wait_time = 2 ** attempt  # Exponential backoff: 1, 2, 4 seconds...
-                        print(f"\nService temporarily unavailable. Retrying in {wait_time} seconds... ({attempt + 1}/{max_retries})")
-                        print(f"Error details: {e}")
+                        wait_time = 30 * (attempt + 1)
+                        log(f"Service unavailable. Waiting {wait_time}s before retry...")
                         time.sleep(wait_time)
                     else:
-                        print(f"\nFailed after {max_retries} attempts due to service issues.")
-                        raise e  # Re-raise the exception if all retries fail
+                        log(f"Failed after {max_retries} attempts")
+                        raise e
                 else:
-                    # For other types of errors, don't retry
                     raise e
 
+        # Parse the JSON response
+        log("")
+        log("[Step 3] Parsing JSON response...")
         parsed_arms = parse_json_response(response_text)
-        # Consistency checks
+        
+        log(f"Parsed {len(parsed_arms)} treatment arm(s)")
+        
+        if not parsed_arms:
+            log("WARNING: No valid treatment arms parsed from response")
+            return None
+        
         for _arm in parsed_arms:
             _validate_category_sums(_arm)
-        if parsed_arms:
-            result_entry = {
-                'filename': extract_pmid_from_filename(filename),
-                'arms': parsed_arms
-            }
-            print(f"\n\nSuccessfully processed {filename} - Found {len(parsed_arms)} treatment arms")
-            return result_entry
-        else:
-            print(f"\n\nWarning: No valid results found for {filename}")
-            return None
+            log(f"  - Arm: {_arm.get('arm_name', 'Unknown')}")
+        
+        result_entry = {
+            'filename': extract_pmid_from_filename(filename),
+            'arms': parsed_arms
+        }
+        
+        log("")
+        log(f"SUCCESS: Extracted {len(parsed_arms)} treatment arm(s) from {filename}")
+        return result_entry
 
     except Exception as e:
-        print(f"\nError processing {filename}: {e}")
+        log(f"ERROR processing {filename}: {e}")
+        import traceback
+        traceback.print_exc()
         return None
-
-    finally:
-        if os.path.exists(temp_pdf_path):
-            os.unlink(temp_pdf_path)
 
 
 def save_aggregate_results(all_results: List[Dict[str, Any]], path: str = 'aggregate_results.json') -> None:
@@ -649,67 +757,87 @@ def save_aggregate_results(all_results: List[Dict[str, Any]], path: str = 'aggre
     print(f"Aggregate results saved to {path}")
 
 
-def save_csv_results(all_results: List[Dict[str, Any]], output_csv_name: str = 'clinical_trial_results.csv'):
-    """Deprecated - now using append_result_to_csv for immediate saves."""
-    # This function is no longer needed as we save incrementally
-    pass
-
-
 def generate():
-    setup_gemini_api_v2()
+    log("=" * 60)
+    log("CLINICAL TRIAL PROTOCOL ANALYZER")
+    log("=" * 60)
     
-    # Get user parameters
+    api_key = setup_openrouter_api()
+    
     params = get_user_processing_parameters()
     if params is None:
         return
     
     csv_filename = params['csv_filename']
     
-    # Initialize CSV if needed
     initialize_csv_if_needed(csv_filename)
-    
-    # Get already-processed filenames
     processed_filenames = get_processed_filenames(csv_filename)
     
-    # Get PDFs to process (excluding already-processed ones)
     pdf_files = get_multiple_pdfs_from_summaries(
         start_index=params['start_index'],
         num_pdfs=params['num_pdfs'],
         processed_filenames=processed_filenames
     )
     if not pdf_files:
-        print("No new PDFs to process.")
+        log("No new PDFs to process.")
         return
 
-    client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
-    model = "gemini-2.5-flash"
+    total_files = len(pdf_files)
+    log(f"")
+    log(f"Starting batch processing of {total_files} PDF(s)")
+    log(f"Sleep between requests: {SLEEP_BETWEEN_REQUESTS} seconds")
+    log(f"")
 
     all_results: List[Dict[str, Any]] = []
     successful_count = 0
+    failed_count = 0
+    start_batch_time = time.time()
     
-    for i, (filename, pdf_content) in enumerate(pdf_files, 1):
-        print(f"\n\nProcessing file {i} of {len(pdf_files)}")
-        result = process_single_pdf(client, filename, pdf_content, model)
+    for i, (filename, pdf_path) in enumerate(pdf_files, 1):
+        file_start_time = time.time()
+        
+        result = process_single_pdf(api_key, filename, pdf_path, i, total_files)
+        
+        file_elapsed = time.time() - file_start_time
+        
         if result:
             all_results.append(result)
-            # Save to CSV immediately after processing
             append_result_to_csv(result, csv_filename)
             successful_count += 1
+            log(f"File {i}/{total_files} completed in {file_elapsed:.2f}s - SUCCESS")
+        else:
+            failed_count += 1
+            log(f"File {i}/{total_files} completed in {file_elapsed:.2f}s - FAILED")
+        
+        # Progress summary
+        log(f"")
+        log(f"PROGRESS: {i}/{total_files} ({(i/total_files)*100:.1f}%) | Success: {successful_count} | Failed: {failed_count}")
+        
+        # Sleep between requests (except for last file)
+        if i < total_files:
+            log(f"Sleeping {SLEEP_BETWEEN_REQUESTS} seconds before next request...")
+            time.sleep(SLEEP_BETWEEN_REQUESTS)
 
-    print(f"\n\n{'='*60}")
-    print("BATCH PROCESSING COMPLETE")
-    print(f"{'='*60}")
-    print(f"Successfully processed: {successful_count} out of {len(pdf_files)} PDFs")
+    # Final summary
+    total_elapsed = time.time() - start_batch_time
+    log(f"")
+    log(f"{'='*60}")
+    log(f"BATCH PROCESSING COMPLETE")
+    log(f"{'='*60}")
+    log(f"Total time: {total_elapsed:.2f} seconds ({total_elapsed/60:.2f} minutes)")
+    log(f"Files processed: {total_files}")
+    log(f"Successful: {successful_count}")
+    log(f"Failed: {failed_count}")
+    log(f"Success rate: {(successful_count/total_files)*100:.1f}%")
 
     if all_results:
         save_aggregate_results(all_results)
         total_arms = sum(len(result['arms']) for result in all_results)
-        print(f"Total treatment arms extracted: {total_arms}")
-        print(f"All results saved to: {csv_filename}")
+        log(f"Total treatment arms extracted: {total_arms}")
+        log(f"Results saved to: {csv_filename}")
     else:
-        print("No new results to save.")
+        log("No results to save.")
 
 
 if __name__ == "__main__":
     generate()
-
